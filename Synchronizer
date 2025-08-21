@@ -1,0 +1,550 @@
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Data;
+using System.Data.SqlClient;
+using System.Threading;
+using Oracle.ManagedDataAccess.Client;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
+using System.IO;
+
+// -------------------------------
+// Domain
+// -------------------------------
+public enum EventType
+{
+    CustomerCreated = 1,
+    CustomerUpdated = 2,
+    OrderPlaced     = 3,
+    // add more as needed
+}
+
+public enum EventStatus
+{
+    Pending   = 0,
+    InProcess = 1,
+    Succeeded = 2,
+    Failed    = 3
+}
+
+public sealed class EventLog
+{
+    public long Id { get; set; }
+    public EventType EventType { get; set; }
+    public EventStatus Status { get; set; }
+    public string PayloadJson { get; set; } // JSON payload
+    public string Origin { get; set; }      // "MSSQL" or "ORACLE" (optional)
+    public DateTime CreatedAt { get; set; }
+    public int RetryCount { get; set; }
+    public string LastError { get; set; }
+}
+
+// -------------------------------
+// Infrastructure — JSON helper
+// -------------------------------
+public static class Json
+{
+    public static T Deserialize<T>(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return default(T);
+
+        var ser = new DataContractJsonSerializer(typeof(T));
+        using (var ms = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(json)))
+        {
+            return (T)ser.ReadObject(ms);
+        }
+    }
+}
+
+// -------------------------------
+// Contracts
+// -------------------------------
+public interface IEventLogRepository
+{
+    IEnumerable<EventLog> GetPending(int take);
+    void MarkInProcess(long id);
+    void MarkSucceeded(long id);
+    void MarkFailed(long id, string errorMessage, int maxErrorLength = 1000);
+    string Name { get; } // for logging
+}
+
+public interface IEventProcessor
+{
+    /// <summary>Return TRUE if processing succeeded (and side-effects committed).</summary>
+    bool Process(EventLog evt, CrossDbContext ctx);
+}
+
+// Provides access to both DBs for cross-DB sync operations
+public sealed class CrossDbContext : IDisposable
+{
+    public SqlConnection SqlConn { get; }
+    public OracleConnection OraConn { get; }
+
+    public CrossDbContext(SqlConnection sqlConn, OracleConnection oraConn)
+    {
+        SqlConn = sqlConn;
+        OraConn = oraConn;
+    }
+
+    public void Dispose()
+    {
+        // Connections are owned outside typically; dispose if you own them.
+    }
+}
+
+// -------------------------------
+// Repositories — SQL Server
+// -------------------------------
+public sealed class SqlServerEventLogRepository : IEventLogRepository
+{
+    private readonly string _connString;
+    public string Name => "MSSQL";
+
+    public SqlServerEventLogRepository(string connString) => _connString = connString;
+
+    public IEnumerable<EventLog> GetPending(int take)
+    {
+        const string sql = @"
+SELECT TOP (@take)
+    Id, EventType, Status, PayloadJson, Origin, CreatedAt, RetryCount, LastError
+FROM dbo.EventLog WITH (READPAST, ROWLOCK)
+WHERE Status = @pending
+ORDER BY CreatedAt ASC;";
+
+        using (var conn = new SqlConnection(_connString))
+        using (var cmd = new SqlCommand(sql, conn))
+        {
+            cmd.Parameters.Add(new SqlParameter("@take", SqlDbType.Int) { Value = take });
+            cmd.Parameters.Add(new SqlParameter("@pending", SqlDbType.Int) { Value = (int)EventStatus.Pending });
+            conn.Open();
+            using (var rdr = cmd.ExecuteReader())
+            {
+                while (rdr.Read())
+                {
+                    yield return new EventLog
+                    {
+                        Id          = rdr.GetInt64(0),
+                        EventType   = (EventType)rdr.GetInt32(1),
+                        Status      = (EventStatus)rdr.GetInt32(2),
+                        PayloadJson = rdr.IsDBNull(3) ? null : rdr.GetString(3),
+                        Origin      = rdr.IsDBNull(4) ? null : rdr.GetString(4),
+                        CreatedAt   = rdr.GetDateTime(5),
+                        RetryCount  = rdr.IsDBNull(6) ? 0 : rdr.GetInt32(6),
+                        LastError   = rdr.IsDBNull(7) ? null : rdr.GetString(7)
+                    };
+                }
+            }
+        }
+    }
+
+    public void MarkInProcess(long id)
+    {
+        ExecNonQuery(@"
+UPDATE dbo.EventLog SET Status = @s, UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @id AND Status = @pending;",
+        p =>
+        {
+            p.Add(new SqlParameter("@s", SqlDbType.Int) { Value = (int)EventStatus.InProcess });
+            p.Add(new SqlParameter("@pending", SqlDbType.Int) { Value = (int)EventStatus.Pending });
+            p.Add(new SqlParameter("@id", SqlDbType.BigInt) { Value = id });
+        });
+    }
+
+    public void MarkSucceeded(long id)
+    {
+        ExecNonQuery(@"
+UPDATE dbo.EventLog SET Status = @s, RetryCount = 0, LastError = NULL, UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @id;",
+        p =>
+        {
+            p.Add(new SqlParameter("@s", SqlDbType.Int) { Value = (int)EventStatus.Succeeded });
+            p.Add(new SqlParameter("@id", SqlDbType.BigInt) { Value = id });
+        });
+    }
+
+    public void MarkFailed(long id, string error, int maxErrorLength = 1000)
+    {
+        if (!string.IsNullOrEmpty(error) && error.Length > maxErrorLength)
+            error = error.Substring(0, maxErrorLength);
+
+        ExecNonQuery(@"
+UPDATE dbo.EventLog
+SET Status = @s, RetryCount = ISNULL(RetryCount,0) + 1, LastError = @err, UpdatedAt = SYSUTCDATETIME()
+WHERE Id = @id;",
+        p =>
+        {
+            p.Add(new SqlParameter("@s", SqlDbType.Int) { Value = (int)EventStatus.Failed });
+            p.Add(new SqlParameter("@err", SqlDbType.NVarChar, maxErrorLength) { Value = (object)error ?? DBNull.Value });
+            p.Add(new SqlParameter("@id", SqlDbType.BigInt) { Value = id });
+        });
+    }
+
+    private void ExecNonQuery(string sql, Action<List<SqlParameter>> addParams)
+    {
+        using (var conn = new SqlConnection(_connString))
+        using (var cmd = new SqlCommand(sql, conn))
+        {
+            var ps = new List<SqlParameter>();
+            addParams(ps);
+            cmd.Parameters.AddRange(ps.ToArray());
+            conn.Open();
+            cmd.ExecuteNonQuery();
+        }
+    }
+}
+
+// -------------------------------
+// Repositories — Oracle
+// -------------------------------
+public sealed class OracleEventLogRepository : IEventLogRepository
+{
+    private readonly string _connString;
+    public string Name => "ORACLE";
+
+    public OracleEventLogRepository(string connString) => _connString = connString;
+
+    public IEnumerable<EventLog> GetPending(int take)
+    {
+        // FETCH FIRST : requires 12c+; for older, wrap in subquery with ROWNUM.
+        const string sql = @"
+SELECT Id, EventType, Status, PayloadJson, Origin, CreatedAt, RetryCount, LastError
+FROM EventLog
+WHERE Status = :pending
+ORDER BY CreatedAt
+FETCH FIRST :take ROWS ONLY";
+
+        using (var conn = new OracleConnection(_connString))
+        using (var cmd = new OracleCommand(sql, conn))
+        {
+            cmd.BindByName = true;
+            cmd.Parameters.Add(new OracleParameter("pending", OracleDbType.Int32) { Value = (int)EventStatus.Pending });
+            cmd.Parameters.Add(new OracleParameter("take", OracleDbType.Int32) { Value = take });
+            conn.Open();
+            using (var rdr = cmd.ExecuteReader())
+            {
+                while (rdr.Read())
+                {
+                    yield return new EventLog
+                    {
+                        Id          = rdr.GetInt64(0),
+                        EventType   = (EventType)rdr.GetInt32(1),
+                        Status      = (EventStatus)rdr.GetInt32(2),
+                        PayloadJson = rdr.IsDBNull(3) ? null : rdr.GetString(3),
+                        Origin      = rdr.IsDBNull(4) ? null : rdr.GetString(4),
+                        CreatedAt   = rdr.GetDateTime(5),
+                        RetryCount  = rdr.IsDBNull(6) ? 0 : rdr.GetInt32(6),
+                        LastError   = rdr.IsDBNull(7) ? null : rdr.GetString(7)
+                    };
+                }
+            }
+        }
+    }
+
+    public void MarkInProcess(long id)
+    {
+        ExecNonQuery(@"
+UPDATE EventLog SET Status = :s, UpdatedAt = SYSTIMESTAMP
+WHERE Id = :id AND Status = :pending",
+        p =>
+        {
+            p.Add(new OracleParameter("s", OracleDbType.Int32) { Value = (int)EventStatus.InProcess });
+            p.Add(new OracleParameter("pending", OracleDbType.Int32) { Value = (int)EventStatus.Pending });
+            p.Add(new OracleParameter("id", OracleDbType.Int64) { Value = id });
+        });
+    }
+
+    public void MarkSucceeded(long id)
+    {
+        ExecNonQuery(@"
+UPDATE EventLog SET Status = :s, RetryCount = 0, LastError = NULL, UpdatedAt = SYSTIMESTAMP
+WHERE Id = :id",
+        p =>
+        {
+            p.Add(new OracleParameter("s", OracleDbType.Int32) { Value = (int)EventStatus.Succeeded });
+            p.Add(new OracleParameter("id", OracleDbType.Int64) { Value = id });
+        });
+    }
+
+    public void MarkFailed(long id, string error, int maxErrorLength = 1000)
+    {
+        if (!string.IsNullOrEmpty(error) && error.Length > maxErrorLength)
+            error = error.Substring(0, maxErrorLength);
+
+        ExecNonQuery(@"
+UPDATE EventLog
+SET Status = :s, RetryCount = NVL(RetryCount,0) + 1, LastError = :err, UpdatedAt = SYSTIMESTAMP
+WHERE Id = :id",
+        p =>
+        {
+            p.Add(new OracleParameter("s", OracleDbType.Int32) { Value = (int)EventStatus.Failed });
+            p.Add(new OracleParameter("err", OracleDbType.NVarchar2, maxErrorLength) { Value = (object)error ?? DBNull.Value });
+            p.Add(new OracleParameter("id", OracleDbType.Int64) { Value = id });
+        });
+    }
+
+    private void ExecNonQuery(string sql, Action<List<OracleParameter>> addParams)
+    {
+        using (var conn = new OracleConnection(_connString))
+        using (var cmd = new OracleCommand(sql, conn))
+        {
+            cmd.BindByName = true;
+            var ps = new List<OracleParameter>();
+            addParams(ps);
+            cmd.Parameters.AddRange(ps.ToArray());
+            conn.Open();
+            cmd.ExecuteNonQuery();
+        }
+    }
+}
+
+// -------------------------------
+// Strategy Implementations
+// -------------------------------
+
+[DataContract]
+public sealed class CustomerPayload
+{
+    [DataMember] public string CustomerId { get; set; }
+    [DataMember] public string Name { get; set; }
+    [DataMember] public string Email { get; set; }
+}
+
+public sealed class CustomerCreatedProcessor : IEventProcessor
+{
+    public bool Process(EventLog evt, CrossDbContext ctx)
+    {
+        var payload = Json.Deserialize<CustomerPayload>(evt.PayloadJson);
+
+        // Example: when event originates in MSSQL, upsert into Oracle; and vice-versa.
+        // Keep idempotency in mind (use primary keys/merge).
+        if (string.Equals(evt.Origin, "MSSQL", StringComparison.OrdinalIgnoreCase))
+        {
+            // Upsert into ORACLE
+            using (var cmd = ctx.OraConn.CreateCommand())
+            {
+                cmd.CommandText = @"
+MERGE INTO Customers t
+USING (SELECT :cid AS CustomerId, :name AS Name, :email AS Email FROM dual) s
+ON (t.CustomerId = s.CustomerId)
+WHEN MATCHED THEN UPDATE SET t.Name = s.Name, t.Email = s.Email
+WHEN NOT MATCHED THEN INSERT (CustomerId, Name, Email) VALUES (s.CustomerId, s.Name, s.Email)";
+                cmd.Parameters.Add(new OracleParameter("cid", OracleDbType.Varchar2) { Value = payload.CustomerId });
+                cmd.Parameters.Add(new OracleParameter("name", OracleDbType.Varchar2) { Value = payload.Name });
+                cmd.Parameters.Add(new OracleParameter("email", OracleDbType.Varchar2) { Value = payload.Email });
+                if (ctx.OraConn.State != ConnectionState.Open) ctx.OraConn.Open();
+                cmd.ExecuteNonQuery();
+            }
+        }
+        else
+        {
+            // Upsert into SQL
+            using (var cmd = ctx.SqlConn.CreateCommand())
+            {
+                cmd.CommandText = @"
+MERGE INTO dbo.Customers AS t
+USING (SELECT @cid AS CustomerId, @name AS Name, @email AS Email) AS s
+ON (t.CustomerId = s.CustomerId)
+WHEN MATCHED THEN UPDATE SET t.Name = s.Name, t.Email = s.Email
+WHEN NOT MATCHED THEN INSERT (CustomerId, Name, Email) VALUES (s.CustomerId, s.Name, s.Email);";
+                cmd.Parameters.Add(new SqlParameter("@cid", SqlDbType.NVarChar) { Value = payload.CustomerId });
+                cmd.Parameters.Add(new SqlParameter("@name", SqlDbType.NVarChar) { Value = payload.Name });
+                cmd.Parameters.Add(new SqlParameter("@email", SqlDbType.NVarChar) { Value = payload.Email });
+                if (ctx.SqlConn.State != ConnectionState.Open) ctx.SqlConn.Open();
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        return true;
+    }
+}
+
+public sealed class CustomerUpdatedProcessor : IEventProcessor
+{
+    public bool Process(EventLog evt, CrossDbContext ctx)
+    {
+        // For demo, reuse same logic as created (idempotent merge)
+        var created = new CustomerCreatedProcessor();
+        return created.Process(evt, ctx);
+    }
+}
+
+// Example placeholder for another event type
+[DataContract]
+public sealed class OrderPayload
+{
+    [DataMember] public string OrderId { get; set; }
+    [DataMember] public string CustomerId { get; set; }
+    [DataMember] public decimal Amount { get; set; }
+}
+
+public sealed class OrderPlacedProcessor : IEventProcessor
+{
+    public bool Process(EventLog evt, CrossDbContext ctx)
+    {
+        var payload = Json.Deserialize<OrderPayload>(evt.PayloadJson);
+
+        if (string.Equals(evt.Origin, "MSSQL", StringComparison.OrdinalIgnoreCase))
+        {
+            using (var cmd = ctx.OraConn.CreateCommand())
+            {
+                cmd.CommandText = @"
+MERGE INTO Orders t
+USING (SELECT :oid AS OrderId, :cid AS CustomerId, :amt AS Amount FROM dual) s
+ON (t.OrderId = s.OrderId)
+WHEN MATCHED THEN UPDATE SET t.CustomerId = s.CustomerId, t.Amount = s.Amount
+WHEN NOT MATCHED THEN INSERT (OrderId, CustomerId, Amount) VALUES (s.OrderId, s.CustomerId, s.Amount)";
+                cmd.Parameters.Add(new OracleParameter("oid", OracleDbType.Varchar2) { Value = payload.OrderId });
+                cmd.Parameters.Add(new OracleParameter("cid", OracleDbType.Varchar2) { Value = payload.CustomerId });
+                cmd.Parameters.Add(new OracleParameter("amt", OracleDbType.Decimal)  { Value = payload.Amount });
+                if (ctx.OraConn.State != ConnectionState.Open) ctx.OraConn.Open();
+                cmd.ExecuteNonQuery();
+            }
+        }
+        else
+        {
+            using (var cmd = ctx.SqlConn.CreateCommand())
+            {
+                cmd.CommandText = @"
+MERGE INTO dbo.Orders AS t
+USING (SELECT @oid AS OrderId, @cid AS CustomerId, @amt AS Amount) AS s
+ON (t.OrderId = s.OrderId)
+WHEN MATCHED THEN UPDATE SET t.CustomerId = s.CustomerId, t.Amount = s.Amount
+WHEN NOT MATCHED THEN INSERT (OrderId, CustomerId, Amount) VALUES (s.OrderId, s.CustomerId, s.Amount);";
+                cmd.Parameters.Add(new SqlParameter("@oid", SqlDbType.NVarChar) { Value = payload.OrderId });
+                cmd.Parameters.Add(new SqlParameter("@cid", SqlDbType.NVarChar) { Value = payload.CustomerId });
+                cmd.Parameters.Add(new SqlParameter("@amt", SqlDbType.Decimal)  { Value = payload.Amount });
+                if (ctx.SqlConn.State != ConnectionState.Open) ctx.SqlConn.Open();
+                cmd.ExecuteNonQuery();
+            }
+        }
+
+        return true;
+    }
+}
+
+// -------------------------------
+// Factory (Strategy Resolver)
+// -------------------------------
+public interface IEventProcessorFactory
+{
+    IEventProcessor Resolve(EventType type);
+}
+
+public sealed class EventProcessorFactory : IEventProcessorFactory
+{
+    private readonly Dictionary<EventType, IEventProcessor> _map;
+
+    public EventProcessorFactory()
+    {
+        _map = new Dictionary<EventType, IEventProcessor>
+        {
+            { EventType.CustomerCreated, new CustomerCreatedProcessor() },
+            { EventType.CustomerUpdated, new CustomerUpdatedProcessor() },
+            { EventType.OrderPlaced,     new OrderPlacedProcessor() }
+        };
+    }
+
+    public IEventProcessor Resolve(EventType type)
+        => _map.TryGetValue(type, out var p) ? p
+           : throw new NotSupportedException($"No processor registered for {type}");
+}
+
+// -------------------------------
+// Synchronizer Service
+// -------------------------------
+public sealed class Synchronizer
+{
+    private readonly IEventLogRepository _sqlRepo;
+    private readonly IEventLogRepository _oraRepo;
+    private readonly IEventProcessorFactory _factory;
+    private readonly string _sqlConnString;
+    private readonly string _oraConnString;
+
+    public Synchronizer(
+        IEventLogRepository sqlRepo,
+        IEventLogRepository oraRepo,
+        IEventProcessorFactory factory,
+        string sqlConnString,
+        string oraConnString)
+    {
+        _sqlRepo = sqlRepo;
+        _oraRepo = oraRepo;
+        _factory = factory;
+        _sqlConnString = sqlConnString;
+        _oraConnString = oraConnString;
+    }
+
+    public void RunLoop(TimeSpan pollInterval, int batchSize, CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            try
+            {
+                ProcessPending(_sqlRepo, batchSize);
+                ProcessPending(_oraRepo, batchSize);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[FATAL] {ex}");
+            }
+
+            // simple delay
+            if (token.WaitHandle.WaitOne(pollInterval)) break;
+        }
+    }
+
+    private void ProcessPending(IEventLogRepository repo, int batchSize)
+    {
+        foreach (var evt in repo.GetPending(batchSize))
+        {
+            Console.WriteLine($"[{repo.Name}] Processing event #{evt.Id} :: {evt.EventType}");
+            try
+            {
+                repo.MarkInProcess(evt.Id);
+
+                using (var sqlConn = new SqlConnection(_sqlConnString))
+                using (var oraConn = new OracleConnection(_oraConnString))
+                using (var ctx = new CrossDbContext(sqlConn, oraConn))
+                {
+                    var processor = _factory.Resolve(evt.EventType);
+                    var ok = processor.Process(evt, ctx);
+
+                    if (ok) repo.MarkSucceeded(evt.Id);
+                    else    repo.MarkFailed(evt.Id, "Processor returned false");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[{repo.Name}] Event #{evt.Id} failed: {ex.Message}");
+                repo.MarkFailed(evt.Id, ex.ToString());
+            }
+        }
+    }
+}
+
+// -------------------------------
+// Program Entry
+// -------------------------------
+class Program
+{
+    static void Main(string[] args)
+    {
+        var sqlConnString = ConfigurationManager.ConnectionStrings["SqlDb"].ConnectionString;
+        var oraConnString = ConfigurationManager.ConnectionStrings["OracleDb"].ConnectionString;
+
+        IEventLogRepository sqlRepo = new SqlServerEventLogRepository(sqlConnString);
+        IEventLogRepository oraRepo = new OracleEventLogRepository(oraConnString);
+        IEventProcessorFactory factory = new EventProcessorFactory();
+
+        var synchronizer = new Synchronizer(sqlRepo, oraRepo, factory, sqlConnString, oraConnString);
+
+        var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (s, e) => { e.Cancel = true; cts.Cancel(); };
+
+        Console.WriteLine("Starting Data Synchronizer. Press Ctrl+C to stop.");
+        synchronizer.RunLoop(TimeSpan.FromSeconds(5), batchSize: 50, token: cts.Token);
+        Console.WriteLine("Stopped.");
+    }
+}
