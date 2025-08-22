@@ -523,6 +523,101 @@ public sealed class Synchronizer
         }
     }
 }
+using System.Data;
+using System.Data.SqlClient;
+using Oracle.ManagedDataAccess.Client;
+using DataSynchronizer.Domain;
+using DataSynchronizer.Infrastructure;
+
+namespace DataSynchronizer.Processing
+{
+    public sealed class CustomerCreatedProcessor : IEventProcessor
+    {
+        public bool Process(EventLog evt, CrossDbContext ctx)
+        {
+            string customerId = evt.EntityId;
+            string name = null;
+            string email = null;
+
+            if (string.Equals(evt.Origin, "MSSQL", StringComparison.OrdinalIgnoreCase))
+            {
+                // 🔹 Fetch from SQL
+                using (var cmd = ctx.SqlConn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT CustomerId, Name, Email FROM Customers WHERE CustomerId = @cid";
+                    cmd.Parameters.Add(new SqlParameter("@cid", SqlDbType.NVarChar) { Value = customerId });
+
+                    if (ctx.SqlConn.State != ConnectionState.Open) ctx.SqlConn.Open();
+                    using (var rdr = cmd.ExecuteReader())
+                    {
+                        if (rdr.Read())
+                        {
+                            name = rdr["Name"].ToString();
+                            email = rdr["Email"].ToString();
+                        }
+                        else return false; // No source row
+                    }
+                }
+
+                // 🔹 Upsert into Oracle
+                using (var cmd = ctx.OraConn.CreateCommand())
+                {
+                    cmd.CommandText = @"
+MERGE INTO Customers t
+USING (SELECT :cid AS CustomerId, :name AS Name, :email AS Email FROM dual) s
+ON (t.CustomerId = s.CustomerId)
+WHEN MATCHED THEN UPDATE SET t.Name = s.Name, t.Email = s.Email
+WHEN NOT MATCHED THEN INSERT (CustomerId, Name, Email) VALUES (s.CustomerId, s.Name, s.Email)";
+                    cmd.Parameters.Add(new OracleParameter("cid", OracleDbType.Varchar2) { Value = customerId });
+                    cmd.Parameters.Add(new OracleParameter("name", OracleDbType.Varchar2) { Value = name });
+                    cmd.Parameters.Add(new OracleParameter("email", OracleDbType.Varchar2) { Value = email });
+
+                    if (ctx.OraConn.State != ConnectionState.Open) ctx.OraConn.Open();
+                    cmd.ExecuteNonQuery();
+                }
+            }
+            else
+            {
+                // 🔹 Fetch from Oracle
+                using (var cmd = ctx.OraConn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT CustomerId, Name, Email FROM Customers WHERE CustomerId = :cid";
+                    cmd.Parameters.Add(new OracleParameter("cid", OracleDbType.Varchar2) { Value = customerId });
+
+                    if (ctx.OraConn.State != ConnectionState.Open) ctx.OraConn.Open();
+                    using (var rdr = cmd.ExecuteReader())
+                    {
+                        if (rdr.Read())
+                        {
+                            name = rdr["Name"].ToString();
+                            email = rdr["Email"].ToString();
+                        }
+                        else return false;
+                    }
+                }
+
+                // 🔹 Upsert into SQL
+                using (var cmd = ctx.SqlConn.CreateCommand())
+                {
+                    cmd.CommandText = @"
+MERGE INTO dbo.Customers AS t
+USING (SELECT @cid AS CustomerId, @name AS Name, @email AS Email) AS s
+ON (t.CustomerId = s.CustomerId)
+WHEN MATCHED THEN UPDATE SET t.Name = s.Name, t.Email = s.Email
+WHEN NOT MATCHED THEN INSERT (CustomerId, Name, Email) VALUES (s.CustomerId, s.Name, s.Email);";
+                    cmd.Parameters.Add(new SqlParameter("@cid", SqlDbType.NVarChar) { Value = customerId });
+                    cmd.Parameters.Add(new SqlParameter("@name", SqlDbType.NVarChar) { Value = name });
+                    cmd.Parameters.Add(new SqlParameter("@email", SqlDbType.NVarChar) { Value = email });
+
+                    if (ctx.SqlConn.State != ConnectionState.Open) ctx.SqlConn.Open();
+                    cmd.ExecuteNonQuery();
+                }
+            }
+
+            return true;
+        }
+    }
+}
 
 // -------------------------------
 // Program Entry
@@ -548,3 +643,4 @@ class Program
         Console.WriteLine("Stopped.");
     }
 }
+
