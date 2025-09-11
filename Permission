@@ -1,10 +1,26 @@
-// Permission.java
 package com.yourorg.entitlement;
 
 public enum Permission {
-    VIEW_OVERVIEW,
-    EDIT_OVERVIEW,
-    CREATE_INITIATIVE,
-    APPROVE_COUNTRY,
-    // add more permissions...
+    // code assignments (example numbers) - change numbers if you need specific values
+    VIEW_OVERVIEW(100),
+    EDIT_OVERVIEW(110),
+    CREATE_INITIATIVE(120),
+    APPROVE_COUNTRY(130);
+
+    private final int code;
+
+    Permission(int code) {
+        this.code = code;
+    }
+
+    public int getCode() {
+        return code;
+    }
+
+    public static Permission fromCode(int code) {
+        for (Permission p : values()) {
+            if (p.code == code) return p;
+        }
+        throw new IllegalArgumentException("Unknown permission code: " + code);
+    }
 }
