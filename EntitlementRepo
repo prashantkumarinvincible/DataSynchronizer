@@ -1,0 +1,36 @@
+// EntitlementRepository.java
+package com.yourorg.entitlement.spi;
+
+import com.yourorg.entitlement.model.ManagedSegment;
+
+import java.util.List;
+
+public interface EntitlementRepository {
+    /**
+     * Returns roles assigned to user (global + managed-segment roles).
+     * Must reflect the user's roles in the system.
+     */
+    List<String> getRolesForUser(Long userId);
+
+    /**
+     * Returns list of managed segments (IDs) the user is entitled to.
+     * Each ManagedSegment contains hierarchical properties like L1-L8 and L2.
+     */
+    List<ManagedSegment> getManagedSegmentsForUser(Long userId);
+
+    /**
+     * Returns managed segments for an initiative so that checks (L2 equality etc.) can be made.
+     */
+    List<ManagedSegment> getManagedSegmentsForInitiative(Long initiativeId);
+
+    /**
+     * Returns whether the user is referenced in owner/contributor/sponsor lists for initiative.
+     * (These tables exist in your system: txnOwner, txnContributor, txnSponsor).
+     */
+    boolean isOwnerContributorOrSponsor(Long initiativeId, Long userId);
+
+    /**
+     * Returns SME reviewer mapping for initiative + country check.
+     */
+    boolean isSmeReviewerMappedForInitiativeCountry(Long initiativeId, Long countryId, Long userId);
+}
