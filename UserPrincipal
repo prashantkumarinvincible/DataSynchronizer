@@ -1,0 +1,14 @@
+// UserPrincipal.java
+package com.yourorg.entitlement.model;
+
+import java.util.List;
+
+public class UserPrincipal {
+    private Long userId;
+    private String username;
+    private boolean active;
+    private Long defaultManagedSegmentId;
+    private List<String> roles; // optional quick roles from token
+
+    // getters/setters / builder
+}
