@@ -1,0 +1,14 @@
+// UserContextService.java
+package com.yourorg.entitlement.spi;
+
+import com.yourorg.entitlement.model.UserPrincipal;
+
+import java.util.Optional;
+
+public interface UserContextService {
+    /**
+     * Return current authenticated user principal (from JWT / SecurityContext / session).
+     * Return Optional.empty() if not authenticated.
+     */
+    Optional<UserPrincipal> getCurrentUser();
+}
