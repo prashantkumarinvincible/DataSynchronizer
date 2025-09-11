@@ -1,0 +1,10 @@
+// Permission.java
+package com.yourorg.entitlement;
+
+public enum Permission {
+    VIEW_OVERVIEW,
+    EDIT_OVERVIEW,
+    CREATE_INITIATIVE,
+    APPROVE_COUNTRY,
+    // add more permissions...
+}
