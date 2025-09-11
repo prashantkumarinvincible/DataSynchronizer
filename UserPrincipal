@@ -1,14 +1,31 @@
-// UserPrincipal.java
 package com.yourorg.entitlement.model;
 
 import java.util.List;
 
+/**
+ * Note: userId is a String per your request.
+ */
 public class UserPrincipal {
-    private Long userId;
+    private String userId;                      // changed to String
     private String username;
     private boolean active;
-    private Long defaultManagedSegmentId;
-    private List<String> roles; // optional quick roles from token
+    private Long defaultManagedSegmentId;       // id of default managed segment
+    private List<String> roles;                 // optional quick roles (names)
 
-    // getters/setters / builder
+    public UserPrincipal() { }
+
+    public String getUserId() { return userId; }
+    public void setUserId(String userId) { this.userId = userId; }
+
+    public String getUsername() { return username; }
+    public void setUsername(String username) { this.username = username; }
+
+    public boolean isActive() { return active; }
+    public void setActive(boolean active) { this.active = active; }
+
+    public Long getDefaultManagedSegmentId() { return defaultManagedSegmentId; }
+    public void setDefaultManagedSegmentId(Long defaultManagedSegmentId) { this.defaultManagedSegmentId = defaultManagedSegmentId; }
+
+    public List<String> getRoles() { return roles; }
+    public void setRoles(List<String> roles) { this.roles = roles; }
 }
