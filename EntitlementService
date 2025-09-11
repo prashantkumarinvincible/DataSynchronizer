@@ -1,0 +1,136 @@
+package com.yourorg.entitlement;
+
+import com.yourorg.entitlement.model.ManagedSegment;
+import com.yourorg.entitlement.model.UserPrincipal;
+import com.yourorg.entitlement.spi.EntitlementRepository;
+import com.yourorg.entitlement.spi.UserContextService;
+import org.springframework.stereotype.Service;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+public class EntitlementService {
+
+    private final UserContextService userContext;
+    private final EntitlementRepository repo;
+
+    public EntitlementService(UserContextService userContext, EntitlementRepository repo) {
+        this.userContext = userContext;
+        this.repo = repo;
+    }
+
+    /**
+     * Generic permission check (no initiative context).
+     */
+    public boolean hasPermission(String permissionName, String... allowedStatuses) {
+        Optional<UserPrincipal> opt = userContext.getCurrentUser();
+        if (opt.isEmpty()) return false;
+        UserPrincipal user = opt.get();
+
+        Permission permission;
+        try {
+            permission = Permission.valueOf(permissionName);
+        } catch (IllegalArgumentException e) {
+            return false; // unknown permission
+        }
+
+        // roles are stored as names
+        List<String> roles = repo.getRolesForUser(user.getUserId());
+        if (roles == null || roles.isEmpty()) return false;
+
+        // Global role shortcut: if any global role contains this permission
+        if (roles.stream().anyMatch(r -> isGlobalRoleWithPermission(r, permission))) return true;
+
+        // For non-global roles we conservatively allow only if the role itself has the permission.
+        // Initiative-level checks (owner/contrib/sponsor, L2) require initiative context.
+        return roles.stream().anyMatch(r -> {
+            try {
+                return Role.valueOf(r).hasPermission(permission);
+            } catch (Exception ex) {
+                return false;
+            }
+        });
+    }
+
+    private boolean isGlobalRoleWithPermission(String roleName, Permission p) {
+        try {
+            Role r = Role.valueOf(roleName);
+            return (r == Role.GLOBAL_MANAGER || r == Role.CBDC_OPERATIONS) && r.hasPermission(p);
+        } catch (Exception ex) {
+            return false;
+        }
+    }
+
+    /**
+     * Check permission in context of an initiative id (+ optional initiativeStatus and countryId).
+     * This enforces L2-same rules, owner/contributor mapping, SME mapping etc.
+     */
+    public boolean hasPermissionForInitiative(String permissionName, Long initiativeId, String initiativeStatus, Long countryId) {
+        Optional<UserPrincipal> opt = userContext.getCurrentUser();
+        if (opt.isEmpty()) return false;
+        UserPrincipal user = opt.get();
+
+        Permission permission;
+        try { permission = Permission.valueOf(permissionName); }
+        catch (IllegalArgumentException e) { return false; }
+
+        List<String> roles = repo.getRolesForUser(user.getUserId());
+        if (roles == null || roles.isEmpty()) return false;
+
+        // 1) Global roles can do everything (subject to role's permission set)
+        if (roles.stream().anyMatch(r -> isGlobalRoleWithPermission(r, permission))) return true;
+
+        // Load segments
+        List<ManagedSegment> userSegments = repo.getManagedSegmentsForUser(user.getUserId());
+        List<ManagedSegment> initSegments = repo.getManagedSegmentsForInitiative(initiativeId);
+
+        // 2) Business User (owner/contributor/sponsor) logic:
+        boolean isOwnerOrContributor = repo.isOwnerContributorOrSponsor(initiativeId, user.getUserId());
+        if (isOwnerOrContributor) {
+            if (isL2Overlap(initSegments, userSegments)) {
+                return roles.stream().anyMatch(r -> {
+                    try { return Role.valueOf(r).hasPermission(permission); }
+                    catch (Exception ex) { return false; }
+                });
+            }
+        }
+
+        // 3) SME reviewer logic (country-level mapping)
+        if (roles.contains(Role.SME_REVIEWER.name()) && repo.isSmeReviewerMappedForInitiativeCountry(initiativeId, countryId, user.getUserId())) {
+            return Role.SME_REVIEWER.hasPermission(permission);
+        }
+
+        // 4) Business Viewer: allow VIEW only when L2 overlaps
+        if (roles.contains(Role.BUSINESS_VIEWER.name()) && permission == Permission.VIEW_OVERVIEW) {
+            return isL2Overlap(initSegments, userSegments);
+        }
+
+        return false;
+    }
+
+    /**
+     * Determine if any managed segment in list A shares the same L2 id with any in list B.
+     * Uses hierarchyString -> getIdAtLevel(2)
+     */
+    private boolean isL2Overlap(List<ManagedSegment> a, List<ManagedSegment> b) {
+        if (a == null || b == null) return false;
+
+        Set<Long> aL2 = a.stream()
+                .map(ms -> ms.getIdAtLevel(2))
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        Set<Long> bL2 = b.stream()
+                .map(ms -> ms.getIdAtLevel(2))
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+
+        if (aL2.isEmpty() || bL2.isEmpty()) return false;
+
+        for (Long id : aL2) {
+            if (bL2.contains(id)) return true;
+        }
+        return false;
+    }
+}
