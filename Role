@@ -1,20 +1,26 @@
-// Role.java
 package com.yourorg.entitlement;
 
 import java.util.EnumSet;
 import java.util.Set;
 
 public enum Role {
-    GLOBAL_MANAGER(EnumSet.allOf(Permission.class)),
-    CBDC_OPERATIONS(EnumSet.of(Permission.VIEW_OVERVIEW, Permission.EDIT_OVERVIEW, Permission.CREATE_INITIATIVE)),
-    BUSINESS_USER(EnumSet.of(Permission.VIEW_OVERVIEW, Permission.CREATE_INITIATIVE, Permission.EDIT_OVERVIEW)),
-    SME_REVIEWER(EnumSet.of(Permission.APPROVE_COUNTRY, Permission.VIEW_OVERVIEW)),
-    BUSINESS_VIEWER(EnumSet.of(Permission.VIEW_OVERVIEW));
+    // numeric role codes (example) + associated permissions
+    GLOBAL_MANAGER(10, EnumSet.allOf(Permission.class)),
+    CBDC_OPERATIONS(20, EnumSet.of(Permission.VIEW_OVERVIEW, Permission.EDIT_OVERVIEW, Permission.CREATE_INITIATIVE)),
+    BUSINESS_USER(30, EnumSet.of(Permission.VIEW_OVERVIEW, Permission.CREATE_INITIATIVE, Permission.EDIT_OVERVIEW)),
+    SME_REVIEWER(40, EnumSet.of(Permission.APPROVE_COUNTRY, Permission.VIEW_OVERVIEW)),
+    BUSINESS_VIEWER(50, EnumSet.of(Permission.VIEW_OVERVIEW));
 
+    private final int code;
     private final EnumSet<Permission> permissions;
 
-    Role(EnumSet<Permission> permissions) {
+    Role(int code, EnumSet<Permission> permissions) {
+        this.code = code;
         this.permissions = permissions;
+    }
+
+    public int getCode() {
+        return code;
     }
 
     public boolean hasPermission(Permission p) {
@@ -23,5 +29,12 @@ public enum Role {
 
     public Set<Permission> getPermissions() {
         return EnumSet.copyOf(permissions);
+    }
+
+    public static Role fromCode(int code) {
+        for (Role r : values()) {
+            if (r.code == code) return r;
+        }
+        throw new IllegalArgumentException("Unknown role code: " + code);
     }
 }
