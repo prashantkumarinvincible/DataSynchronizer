@@ -1,0 +1,24 @@
+// HasPermission.java
+package com.yourorg.entitlement.annotation;
+
+import java.lang.annotation.*;
+
+@Target({ElementType.METHOD, ElementType.TYPE})
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+public @interface HasPermission {
+    /**
+     * permission name (use enum name string), e.g. "EDIT_OVERVIEW"
+     */
+    String value();
+
+    /**
+     * Optional list of allowed initiative statuses. If non-empty, aspect will also verify
+     * that the initiative (if provided via method args or explicitly verified programmatically)
+     * is in one of these statuses.
+     *
+     * Note: Annotation-level status check is best-effort — you still should call
+     * UserEntitlement.hasPermission(...) inside business code where needed.
+     */
+    String[] allowedStatuses() default {};
+}
