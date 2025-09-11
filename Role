@@ -1,0 +1,27 @@
+// Role.java
+package com.yourorg.entitlement;
+
+import java.util.EnumSet;
+import java.util.Set;
+
+public enum Role {
+    GLOBAL_MANAGER(EnumSet.allOf(Permission.class)),
+    CBDC_OPERATIONS(EnumSet.of(Permission.VIEW_OVERVIEW, Permission.EDIT_OVERVIEW, Permission.CREATE_INITIATIVE)),
+    BUSINESS_USER(EnumSet.of(Permission.VIEW_OVERVIEW, Permission.CREATE_INITIATIVE, Permission.EDIT_OVERVIEW)),
+    SME_REVIEWER(EnumSet.of(Permission.APPROVE_COUNTRY, Permission.VIEW_OVERVIEW)),
+    BUSINESS_VIEWER(EnumSet.of(Permission.VIEW_OVERVIEW));
+
+    private final EnumSet<Permission> permissions;
+
+    Role(EnumSet<Permission> permissions) {
+        this.permissions = permissions;
+    }
+
+    public boolean hasPermission(Permission p) {
+        return permissions.contains(p);
+    }
+
+    public Set<Permission> getPermissions() {
+        return EnumSet.copyOf(permissions);
+    }
+}
