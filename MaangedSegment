@@ -1,0 +1,62 @@
+package com.yourorg.entitlement.model;
+
+/**
+ * ManagedSegment model reflecting columns:
+ * managedSegmentId, managedSegmentName, status (1=active,2=inactive),
+ * hierarchyString (e.g. "1/4921/25302"), level, parentId, hasChildren
+ */
+public class ManagedSegment {
+    private Long managedSegmentId;
+    private String managedSegmentName;
+    private int status;             // 1 = active, 2 = inactive
+    private String hierarchyString; // e.g. "1/4921/25302"
+    private int level;              // level number for this segment
+    private Long parentId;
+    private boolean hasChildren;
+
+    // constructors, getters, setters
+
+    public ManagedSegment() {}
+
+    public Long getManagedSegmentId() { return managedSegmentId; }
+    public void setManagedSegmentId(Long managedSegmentId) { this.managedSegmentId = managedSegmentId; }
+
+    public String getManagedSegmentName() { return managedSegmentName; }
+    public void setManagedSegmentName(String managedSegmentName) { this.managedSegmentName = managedSegmentName; }
+
+    public int getStatus() { return status; }
+    public void setStatus(int status) { this.status = status; }
+
+    public String getHierarchyString() { return hierarchyString; }
+    public void setHierarchyString(String hierarchyString) { this.hierarchyString = hierarchyString; }
+
+    public int getLevel() { return level; }
+    public void setLevel(int level) { this.level = level; }
+
+    public Long getParentId() { return parentId; }
+    public void setParentId(Long parentId) { this.parentId = parentId; }
+
+    public boolean isHasChildren() { return hasChildren; }
+    public void setHasChildren(boolean hasChildren) { this.hasChildren = hasChildren; }
+
+    /**
+     * Extract the managed-segment id at the requested hierarchy level.
+     * Example: hierarchyString = "1/4921/25302"
+     * getIdAtLevel(1) -> 1
+     * getIdAtLevel(2) -> 4921
+     * getIdAtLevel(3) -> 25302
+     *
+     * Levels are 1-indexed.
+     */
+    public Long getIdAtLevel(int targetLevel) {
+        if (hierarchyString == null || hierarchyString.trim().isEmpty()) return null;
+        String[] parts = hierarchyString.split("/");
+        int idx = targetLevel - 1; // convert 1-index to 0-index
+        if (idx < 0 || idx >= parts.length) return null;
+        try {
+            return Long.valueOf(parts[idx]);
+        } catch (NumberFormatException ex) {
+            return null;
+        }
+    }
+}
